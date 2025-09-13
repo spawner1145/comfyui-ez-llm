@@ -4,7 +4,7 @@
 <img height="147" alt="image" src="imgs/dec3380e-0dfc-42e2-b203-1f7673595cd3.png" />
 
 并把你从huggingface拿到的所有模型仓库的东西都放进去:
-<img height="147" alt="image" src="imgs/04adbe75-0fb8-465f-baa0-02fcfeb1e7e8.png" />
+<img width="300" alt="image" src="imgs/04adbe75-0fb8-465f-baa0-02fcfeb1e7e8.png" />
 
 目前不兼容`cuda-malloc`,所以启动参数里加个`--disable-cuda-malloc`,例如`/root/miniconda3/bin/python main.py --port 6006 --disable-cuda-malloc`这样来启动你的comfyui
 
