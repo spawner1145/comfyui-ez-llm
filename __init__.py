@@ -95,6 +95,7 @@ class LLMTextGenerator:
                 
                 "num_beams": ("INT", {"default": 1, "min": 1, "max": 16, "step": 1, "tooltip": "集束搜索的光束数。大于1启用，速度变慢但质量可能更高。/ Number of beams for beam search. >1 enables it, which is slower but may yield higher quality."}),
                 "length_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05, "tooltip": "长度惩罚因子，仅在num_beams>1时生效。/ Length penalty factor, only effective when num_beams > 1."}),
+                "should_change": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "image_1": ("LLM_IMAGE",),
@@ -115,7 +116,7 @@ class LLMTextGenerator:
     def generate_text(self, model_name, model_mode, system_prompt, user_prompt, 
                       max_new_tokens, min_new_tokens, do_sample, temperature, top_p, top_k,
                       repetition_penalty, no_repeat_ngram_size, num_beams, length_penalty,
-                      image_1=None, image_2=None, image_3=None, prompt=None, extra_pnginfo=None):
+                      image_1=None, image_2=None, image_3=None, prompt=None, extra_pnginfo=None, should_change = False):
         
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -218,6 +219,13 @@ class LLMTextGenerator:
         print(f"输出\n{result_text}\n")
         
         return (result_text,)
+
+    @classmethod
+    def IS_CHANGED(s, should_change=False, *args, **kwargs):
+        if should_change:
+            return float("NaN")
+        else:
+            return False
 
 NODE_CLASS_MAPPINGS = {
     "LLMTextGenerator": LLMTextGenerator,
