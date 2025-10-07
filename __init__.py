@@ -156,6 +156,10 @@ class LLMTextGenerator:
                     self.current_model_type = 'vision'
                 else:
                     self.loaded_tokenizer = AutoTokenizer.from_pretrained(model_path)
+                    if self.loaded_tokenizer.chat_template is None:
+                        print(f"警告：模型 {model_name} 未设置chat_template，将使用文本拼接模式")
+                    else:
+                        print(f"模型 {model_name} 已检测到chat_template，将使用模板模式")
                     pbar.update(1)
                     self.loaded_model = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto").eval()
                     self.current_model_type = 'text'
@@ -181,9 +185,29 @@ class LLMTextGenerator:
             messages.append({"role": "user", "content": user_content})
             inputs = self.loaded_processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt").to(self.loaded_model.device)
         else:
-            if any([image_1, image_2, image_3]): print("警告：当前为纯文本模式，所有图像输入都将被忽略。")
-            messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-            inputs = self.loaded_tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt").to(device)
+            if any([image_1, image_2, image_3]): 
+                print("警告：当前为纯文本模式，所有图像输入都将被忽略。")
+        
+            if self.loaded_tokenizer.chat_template is not None:
+                messages = [
+                    {"role": "system", "content": system_prompt}, 
+                    {"role": "user", "content": user_prompt}
+                ]
+                inputs = self.loaded_tokenizer.apply_chat_template(
+                    messages, 
+                    add_generation_prompt=True, 
+                    tokenize=True, 
+                    return_dict=True, 
+                    return_tensors="pt"
+                ).to(self.loaded_model.device)
+            else:
+                prompt_parts = []
+                if system_prompt.strip():
+                    prompt_parts.append(f"{system_prompt} <Prompt Start>\n")
+                prompt_parts.append(user_prompt)
+                final_prompt = "".join(prompt_parts)
+                
+                inputs = self.loaded_tokenizer(final_prompt, return_tensors="pt").to (self.loaded_model.device)
 
         generation_kwargs = {
             "max_new_tokens": max_new_tokens,
