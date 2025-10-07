@@ -587,7 +587,7 @@ class LLMCLIPLoader:
                     "tooltip": "目标隐藏层大小。Gemma-2 9B=2304, Qwen-3=1024, 如果与模型不匹配将自动添加投影层"
                 }),
                 "enable_weights": ("BOOLEAN", {
-                    "default": False,
+                    "default": True,
                     "tooltip": "启用权重功能：支持 (word:1.5) 语法和超长提示词自动分批。默认关闭以保持与原版 SPieceTokenizer 一致"
                 }),
             }
