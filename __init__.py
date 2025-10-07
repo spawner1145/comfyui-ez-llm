@@ -10,6 +10,7 @@ from transformers import (
 )
 import folder_paths
 import comfy.utils
+from .clip_anything import LLMLoader, LLMTextEncode, LLMCLIPLoader
 
 llm_base_dir = os.path.join(folder_paths.models_dir, 'LLM')
 
@@ -254,9 +255,17 @@ class LLMTextGenerator:
 NODE_CLASS_MAPPINGS = {
     "LLMTextGenerator": LLMTextGenerator,
     "LLMImageEncoder": LLMImageEncoder,
+
+    "LLMLoader": LLMLoader,
+    "LLMTextEncode": LLMTextEncode,
+    "LLMCLIPLoader": LLMCLIPLoader,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LLMTextGenerator": "LLM 文本生成器",
     "LLMImageEncoder": "LLM 图像编码器",
+
+    "LLMLoader": "LLM Loader (Universal)",
+    "LLMTextEncode": "LLM Text Encode",
+    "LLMCLIPLoader": "Load LLM as CLIP (Universal)",
 }
