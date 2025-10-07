@@ -7,7 +7,10 @@ import comfy.sd1_clip
 import comfy.model_management
 import comfy.model_patcher
 import comfy.hooks
+import comfy.ops
 import logging
+import re
+from typing import List, Tuple
 
 llm_dir = os.path.join(folder_paths.models_dir, "LLM")
 if not os.path.exists(llm_dir):
@@ -15,6 +18,126 @@ if not os.path.exists(llm_dir):
 
 if "LLM" not in folder_paths.folder_names_and_paths:
     folder_paths.folder_names_and_paths["LLM"] = ([llm_dir], {".safetensors", ".bin", ".pt"})
+
+def parse_parentheses(string):
+    result = []
+    current_item = ""
+    nesting_level = 0
+    for char in string:
+        if char == "(":
+            if nesting_level == 0:
+                if current_item:
+                    result.append(current_item)
+                    current_item = "("
+                else:
+                    current_item = "("
+            else:
+                current_item += char
+            nesting_level += 1
+        elif char == ")":
+            nesting_level -= 1
+            if nesting_level == 0:
+                result.append(current_item + ")")
+                current_item = ""
+            else:
+                current_item += char
+        else:
+            current_item += char
+    if current_item:
+        result.append(current_item)
+    return result
+
+def token_weights(string, current_weight):
+    """
+    (word) - 权重 * 1.1
+    (word:1.5) - 权重 1.5
+    ((word)) - 权重 * 1.1 * 1.1 = 1.21
+    """
+    a = parse_parentheses(string)
+    out = []
+    for x in a:
+        weight = current_weight
+        if len(x) >= 2 and x[-1] == ')' and x[0] == '(':
+            x = x[1:-1]
+            xx = x.rfind(":")
+            weight *= 1.1  # 默认权重倍数
+            if xx > 0:
+                try:
+                    weight = float(x[xx+1:])  # 显式指定权重
+                    x = x[:xx]
+                except:
+                    pass
+            out += token_weights(x, weight)
+        else:
+            out += [(x, current_weight)]
+    return out
+
+def escape_important(text):
+    """转义"""
+    text = text.replace("\\)", "\0\1")
+    text = text.replace("\\(", "\0\2")
+    return text
+
+def unescape_important(text):
+    text = text.replace("\0\1", ")")
+    text = text.replace("\0\2", "(")
+    return text
+
+
+def parse_prompt_with_comfy_weights(text: str) -> List[Tuple[str, float]]:
+    """
+    (word) - 权重 * 1.1
+    (word:1.5) - 权重 1.5
+    ((word)) - 嵌套权重
+    \( \) - 转义括号
+    """
+    text = escape_important(text)
+    parsed = token_weights(text, 1.0)
+    # 还原转义
+    result = [(unescape_important(t), w) for t, w in parsed]
+    return result
+
+
+def chunk_weighted_prompt(text: str, max_length: int, tokenizer) -> List[List[Tuple[str, float]]]:
+    """
+    使用 ComfyUI 的权重解析 + 自动分块
+    """
+    weighted_segments = parse_prompt_with_comfy_weights(text)
+    
+    chunks = []
+    current_chunk = []
+    current_length = 0
+    
+    for segment_text, weight in weighted_segments:
+        if not segment_text.strip():
+            continue
+            
+        # 估算 token 长度
+        tokens = tokenizer(segment_text, add_special_tokens=False)["input_ids"]
+        segment_length = len(tokens)
+        
+        # 如果加上这个 segment 会超出，先保存当前 chunk
+        if current_length + segment_length > max_length and current_chunk:
+            chunks.append(current_chunk)
+            current_chunk = []
+            current_length = 0
+        
+        # 如果单个 segment 就超长，强制截断
+        if segment_length > max_length:
+            # 逐 token 分割
+            for i in range(0, segment_length, max_length):
+                chunk_tokens = tokens[i:i+max_length]
+                chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
+                chunks.append([(chunk_text, weight)])
+        else:
+            current_chunk.append((segment_text, weight))
+            current_length += segment_length
+    
+    # 添加最后一个 chunk
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    return chunks if chunks else [[("", 1.0)]]
 
 DTYPES = {
     "default": None,
@@ -155,9 +278,11 @@ class LLMTextEncode:
         return ([[cond, {"attention_mask": attention_mask}]], )
 
 class LLMTokenizerComfy(comfy.sd1_clip.SDTokenizer):
-    def __init__(self, hf_tokenizer, system_prompt, embedding_directory=None, max_length=512):
-        self.tokenizer = hf_tokenizer
+    def __init__(self, hf_tokenizer, system_prompt, embedding_directory=None, max_length=9999999, enable_weights=False):
+        self.hf_tokenizer = hf_tokenizer
         self.system_prompt = system_prompt
+        self.enable_weights = enable_weights
+        self.max_length = max_length
 
         self.use_chat_template = hasattr(hf_tokenizer, 'chat_template') and hf_tokenizer.chat_template is not None
         if self.use_chat_template:
@@ -165,13 +290,10 @@ class LLMTokenizerComfy(comfy.sd1_clip.SDTokenizer):
         else:
             print(f"未检测到 chat_template，将使用文本拼接模式")
         
-        self.max_length = max_length if max_length > 0 else 99999999
-        self.min_length = 1
-        self.end_token = None
-        self.min_padding = None
+        print(f"权重功能: {'启用 (ComfyUI原版)' if self.enable_weights else '禁用'}")
         
         # 检测 special tokens
-        empty = self.tokenizer('')["input_ids"]
+        empty = hf_tokenizer('')["input_ids"]
         
         # 根据 tokenizer 配置 start/end token
         if hasattr(hf_tokenizer, 'bos_token_id') and hf_tokenizer.bos_token_id is not None:
@@ -193,69 +315,108 @@ class LLMTokenizerComfy(comfy.sd1_clip.SDTokenizer):
         else:
             self.pad_token = 0
         
-        self.pad_with_end = False  # LLM 通常不用 end token padding
-        self.pad_to_max_length = False  # 不强制 padding
+        self.pad_with_end = False
+        self.pad_to_max_length = False
+        self.min_length = 1
+        self.min_padding = None
         
         # 词汇表
-        vocab = self.tokenizer.get_vocab()
+        vocab = hf_tokenizer.get_vocab()
         self.inv_vocab = {v: k for k, v in vocab.items()}
         
-        # embedding 相关
+        # embedding 相关（保持兼容性）
         self.embedding_directory = embedding_directory
         self.max_word_length = 8
         self.embedding_identifier = "embedding:"
-        self.embedding_size = 2304  # 默认值，实际不影响
+        self.embedding_size = 2304
         self.embedding_key = 'llm'
     
     def tokenize_with_weights(self, text, return_word_ids=False, **kwargs):
-        """
-        选择模板模式(如果有的话)或文本拼接模式
-        """
+        # 应用 system_prompt
         if self.use_chat_template:
             try:
                 messages = [
                     {"role": "system", "content": self.system_prompt},
                     {"role": "user", "content": text}
                 ]
-                # 只获取格式化后的文本，不直接 tokenize
-                full_prompt = self.tokenizer.apply_chat_template(
+                full_prompt = self.hf_tokenizer.apply_chat_template(
                     messages, 
-                    add_generation_prompt=False,  # 不添加生成提示（因为只是在编码，不是生成）
-                    tokenize=False  # 返回文本而不是 token IDs
+                    add_generation_prompt=False,
+                    tokenize=False
                 )
             except Exception as e:
                 print(f"chat_template 应用失败，降级到文本拼接: {e}")
                 full_prompt = f'{self.system_prompt} <Prompt Start> {text}'
         else:
-            # 文本拼接模式
             full_prompt = f'{self.system_prompt} <Prompt Start> {text}'
         
-        return super().tokenize_with_weights(full_prompt, return_word_ids, disable_weights=False, **kwargs)
+        if not self.enable_weights:
+            # 禁用权重：直接 tokenize，不分块
+            tokens = self.hf_tokenizer(full_prompt, add_special_tokens=True)["input_ids"]
+            # 返回格式：[[(token_id, weight, word_id), ...]]
+            result = [[(t, 1.0, 0) for t in tokens]]
+            return result
+        
+        chunks = chunk_weighted_prompt(full_prompt, self.max_length - 2, self.hf_tokenizer)  # -2 for start/end tokens
+        
+        batched_tokens = []
+        for chunk_idx, chunk in enumerate(chunks):
+            batch = []
+            
+            # 添加 start token
+            if self.start_token is not None:
+                batch.append((self.start_token, 1.0, 0))
+            
+            # 处理每个 weighted segment
+            for segment_text, weight in chunk:
+                # tokenize segment
+                segment_tokens = self.hf_tokenizer(
+                    segment_text, 
+                    add_special_tokens=False
+                )["input_ids"]
+                
+                # 添加带权重的 tokens
+                # word_id 使用 chunk_idx + 1（0 保留给特殊 token）
+                batch.extend([(t, weight, chunk_idx + 1) for t in segment_tokens])
+            
+            # 添加 end token
+            if self.end_token is not None:
+                batch.append((self.end_token, 1.0, 0))
+            
+            # padding 到 max_length（如果需要）
+            if self.pad_to_max_length and len(batch) < self.max_length:
+                batch.extend([(self.pad_token, 1.0, 0)] * (self.max_length - len(batch)))
+            
+            batched_tokens.append(batch)
+        
+        # 如果不需要 word_ids，移除第三个元素
+        if not return_word_ids:
+            batched_tokens = [[(t, w) for t, w, _ in batch] for batch in batched_tokens]
+        
+        return batched_tokens
     
     def state_dict(self):
-        """ComfyUI 需要的方法 (保存 tokenizer 状态)"""
+        """ComfyUI 需要的方法"""
         return {}
 
 
-class LLMTextEncoderComfy(comfy.sd1_clip.ClipTokenWeightEncoder):
-    def __init__(self, hf_model, hf_tokenizer, device="cpu", dtype=None, target_hidden_size=None):
-        super().__init__()
-        self.hf_model = hf_model
-        self.hf_tokenizer = hf_tokenizer
-        self.device = device
-        self.dtype = dtype
-        self.dtypes = [dtype] if dtype else [torch.float32]
+class LLMTextEncoderComfy(torch.nn.Module, comfy.sd1_clip.ClipTokenWeightEncoder):
+    def __init__(self, hf_model, hf_tokenizer, device="cpu", dtype=None, target_hidden_size=None, model_options={}):
+        torch.nn.Module.__init__(self)
+        comfy.sd1_clip.ClipTokenWeightEncoder.__init__(self)
         
+        # 获取模型配置
         if hasattr(hf_model, 'config'):
             self.num_layers = getattr(hf_model.config, 'num_hidden_layers', 26)
             self.hidden_size = getattr(hf_model.config, 'hidden_size', 2304)
-        else:  # 默认值
+        else:
             self.num_layers = 26
             self.hidden_size = 2304
         
         self.target_hidden_size = target_hidden_size if target_hidden_size else self.hidden_size
         self.projection = None
         
+        # 如果需要维度投影
         if self.hidden_size != self.target_hidden_size:
             print(f"检测到维度不匹配: {self.hidden_size} != {self.target_hidden_size}")
             print(f"创建投影层: Linear({self.hidden_size}, {self.target_hidden_size})")
@@ -269,20 +430,31 @@ class LLMTextEncoderComfy(comfy.sd1_clip.ClipTokenWeightEncoder):
             if dtype:
                 self.projection = self.projection.to(dtype)
         
-        self.special_tokens = self._get_special_tokens()
+        self.hf_model = hf_model
+        self.hf_tokenizer = hf_tokenizer
+        self.transformer = hf_model  # SDClipModel 兼容
+        self.device = device
+        self.dtype = dtype
+        self.dtypes = [dtype] if dtype else [torch.float32]
         
-        # CLIP options (用于 layer 选择等)
+        # CLIP 标准属性
+        self.max_length = 512
         self.layer = "hidden"
-        self.layer_idx = -2  # 默认倒数第二层，懒得写到前端，懂的人自己改吧()
-        self.return_projected_pooled = False  # LLM 通常不需要 projected pooled
-
+        self.layer_idx = -2
+        self.return_projected_pooled = False
+        self.special_tokens = self._get_special_tokens()
         self.options_default = (self.layer, self.layer_idx, self.return_projected_pooled)
+        
+        self.enable_attention_masks = True
+        self.return_attention_masks = True
+        self.layer_norm_hidden_state = False
+        self.logit_scale = torch.nn.Parameter(torch.tensor(4.6055))
+        self.operations = model_options.get("custom_operations", comfy.ops.manual_cast)
     
     def _get_special_tokens(self):
         """从 tokenizer 自动获取 special tokens"""
         special_tokens = {}
         
-        # 尝试获取各种 special tokens
         if hasattr(self.hf_tokenizer, 'bos_token_id') and self.hf_tokenizer.bos_token_id is not None:
             special_tokens["start"] = self.hf_tokenizer.bos_token_id
         
@@ -292,48 +464,51 @@ class LLMTextEncoderComfy(comfy.sd1_clip.ClipTokenWeightEncoder):
         if hasattr(self.hf_tokenizer, 'pad_token_id') and self.hf_tokenizer.pad_token_id is not None:
             special_tokens["pad"] = self.hf_tokenizer.pad_token_id
         else:
-            # 如果没有 pad_token，使用 eos_token
             special_tokens["pad"] = special_tokens.get("end", 0)
         
-        # 如果都没有，使用通用默认值
         if not special_tokens:
             special_tokens = {"start": 2, "end": 1, "pad": 0}
         
         return special_tokens
     
+    def freeze(self):
+        """冻结模型参数"""
+        self.transformer = self.transformer.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+    
     def reset_clip_options(self):
-        """ComfyUI CLIP 需要的方法"""
+        """重置 CLIP 选项"""
         self.layer = self.options_default[0]
         self.layer_idx = self.options_default[1]
         self.return_projected_pooled = self.options_default[2]
     
     def set_clip_options(self, options):
-        """ComfyUI CLIP 需要的方法，实现 layer 选择"""
+        """设置 CLIP 选项 - layer 选择"""
         layer_idx = options.get("layer", self.layer_idx)
         self.return_projected_pooled = options.get("projected_pooled", self.return_projected_pooled)
         
-        # 验证 layer_idx
         if layer_idx is None or abs(layer_idx) > self.num_layers:
             self.layer = "last"
-            self.layer_idx = -1
+            self.layer_idx = None
         else:
             self.layer = "hidden"
             self.layer_idx = layer_idx
     
     def gen_empty_tokens(self, special_tokens, length):
-        """ClipTokenWeightEncoder 需要的方法，生成空 token 序列"""
+        """生成空 token 序列"""
         return comfy.sd1_clip.gen_empty_tokens(special_tokens, length)
     
     def state_dict(self):
-        """ModelPatcher 需要的方法，返回模型的 state_dict"""
+        """返回模型的 state_dict"""
         return self.hf_model.state_dict()
     
     def load_state_dict(self, state_dict):
-        """加载 state_dict（用于 LoRA 等）"""
+        """加载 state_dict"""
         return self.hf_model.load_state_dict(state_dict, strict=False)
     
     def to(self, device):
-        """ModelPatcher 需要的方法，移动模型到指定设备"""
+        """移动模型到指定设备"""
         self.hf_model = self.hf_model.to(device)
         if self.projection is not None:
             self.projection = self.projection.to(device)
@@ -341,7 +516,7 @@ class LLMTextEncoderComfy(comfy.sd1_clip.ClipTokenWeightEncoder):
         return self
     
     def named_modules(self):
-        """ModelPatcher 需要的方法，返回所有子模块"""
+        """返回所有子模块"""
         return self.hf_model.named_modules()
     
     def parameters(self):
@@ -353,15 +528,9 @@ class LLMTextEncoderComfy(comfy.sd1_clip.ClipTokenWeightEncoder):
         return self.hf_model.named_parameters()
     
     def encode(self, tokens_list):
-        """
-        ClipTokenWeightEncoder 需要的方法，只处理 tokens，不处理 weights
-        ClipTokenWeightEncoder.encode_token_weights() 会自动调用这个方法并处理权重
-        
-        输入: tokens_list (list of list of token_id)
-        输出: (cond, pooled) 或 (cond, pooled, extra_dict)
-        """
         input_ids = torch.tensor(tokens_list, dtype=torch.long).to(self.hf_model.device)
         attention_mask = (input_ids != self.special_tokens.get("pad", 0)).long()
+        
         with torch.no_grad():
             outputs = self.hf_model(
                 input_ids=input_ids,
@@ -370,36 +539,22 @@ class LLMTextEncoderComfy(comfy.sd1_clip.ClipTokenWeightEncoder):
                 return_dict=True,
             )
             
-            # 根据 layer_idx 选择输出层
-            if self.layer == "last" or self.layer_idx == -1:
-                hidden_states = outputs.last_hidden_state
-            else:
-                # hidden_states 是 tuple，索引从 0 开始
-                # layer_idx 可以是负数（从后往前）或正数（从前往后）
-                hidden_states = outputs.hidden_states[self.layer_idx]
-            
-            # attention mask
+            hidden_states = outputs.hidden_states[-2]
+
             cond = hidden_states * attention_mask.unsqueeze(-1)
             
-            # 维度投影（神人功能XD）
+            # 维度投影
             if self.projection is not None:
-                # [batch, seq_len, hidden_size] -> [batch, seq_len, target_hidden_size]
                 original_shape = cond.shape
                 cond = self.projection(cond)
                 print(f"应用维度投影: {original_shape} -> {cond.shape}")
         
-        # 计算 pooled
-        if self.return_projected_pooled:
-            # 如果需要 projected pooled，使用第一个 token (CLS/BOS)
-            pooled = cond[:, 0, :]
-        else:
-            # 默认：平均池化（忽略 padding）
-            mask_expanded = attention_mask.unsqueeze(-1).expand(cond.size()).float()
-            sum_embeddings = torch.sum(cond * mask_expanded, 1)
-            sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
-            pooled = sum_embeddings / sum_mask
+        # 计算 pooled（简单平均）
+        mask_expanded = attention_mask.unsqueeze(-1).expand(cond.size()).float()
+        sum_embeddings = torch.sum(cond * mask_expanded, 1)
+        sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
+        pooled = sum_embeddings / sum_mask
         
-        # 返回结果（ClipTokenWeightEncoder 会负责移动到 intermediate_device 和处理 weights）
         return cond, pooled, {"attention_mask": attention_mask}
 
 
@@ -431,6 +586,10 @@ class LLMCLIPLoader:
                     "step": 128,
                     "tooltip": "目标隐藏层大小。Gemma-2 9B=2304, Qwen-3=1024, 如果与模型不匹配将自动添加投影层"
                 }),
+                "enable_weights": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "启用权重功能：支持 (word:1.5) 语法和超长提示词自动分批。默认关闭以保持与原版 SPieceTokenizer 一致"
+                }),
             }
         }
     
@@ -441,7 +600,7 @@ class LLMCLIPLoader:
     TITLE = "Load LLM as CLIP (Universal)"
     DESCRIPTION = "从 HF 仓库加载任意 LLM，输出真正的 ComfyUI CLIP 接口"
 
-    def load_clip(self, model_folder, system_prompt, device, dtype, target_hidden_size=2304):
+    def load_clip(self, model_folder, system_prompt, device, dtype, target_hidden_size=2304, enable_weights=False):
         dtype_torch = DTYPES[dtype]
         if device == "cpu" and dtype_torch not in [None, torch.float32]:
             raise ValueError(f"CPU 只支持 FP32 或 default! 当前: {dtype}")
@@ -452,6 +611,7 @@ class LLMCLIPLoader:
         
         print(f"[LLM CLIP] Loading from {model_path}...")
         print(f"[LLM CLIP] Target hidden size: {target_hidden_size}")
+        print(f"[LLM CLIP] Enable weights: {enable_weights}")
         
         # 加载 HF 模型和 tokenizer (与 LLMLoader 相同逻辑)
         hf_tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -472,9 +632,12 @@ class LLMCLIPLoader:
             hf_model = hf_model.to(dtype_torch)
         
         # 包装为 ComfyUI 接口
-        # 使用较大的 max_length（与 Lumina2/Qwen 等 LLM text encoders 对齐）
-        # 默认 512，可以根据模型调整（Lumina2 实际不限制长度，使用 99999999）
-        comfy_tokenizer = LLMTokenizerComfy(hf_tokenizer, system_prompt, max_length=512)
+        comfy_tokenizer = LLMTokenizerComfy(
+            hf_tokenizer, 
+            system_prompt, 
+            max_length=9999999,
+            enable_weights=enable_weights
+        )
         comfy_text_encoder = LLMTextEncoderComfy(
             hf_model, 
             hf_tokenizer, 
