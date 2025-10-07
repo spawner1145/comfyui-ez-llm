@@ -302,9 +302,12 @@ class LLMTokenizerComfy(comfy.sd1_clip.SDTokenizer):
             self.tokenizer_adds_end_token = True
             if hasattr(hf_tokenizer, 'eos_token_id') and hf_tokenizer.eos_token_id is not None:
                 self.end_token = hf_tokenizer.eos_token_id
+            else:
+                self.end_token = None
         else:
             self.tokens_start = 0
             self.start_token = None
+            self.end_token = None
             self.tokenizer_adds_end_token = False
         
         # pad_token
