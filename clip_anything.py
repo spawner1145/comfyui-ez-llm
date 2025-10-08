@@ -20,6 +20,7 @@ if "LLM" not in folder_paths.folder_names_and_paths:
     folder_paths.folder_names_and_paths["LLM"] = ([llm_dir], {".safetensors", ".bin", ".pt"})
 
 def parse_parentheses(string):
+    """解析括号嵌套结构"""
     result = []
     current_item = ""
     nesting_level = 0
@@ -49,9 +50,11 @@ def parse_parentheses(string):
 
 def token_weights(string, current_weight):
     """
-    (word) - 权重 * 1.1
-    (word:1.5) - 权重 1.5
-    ((word)) - 权重 * 1.1 * 1.1 = 1.21
+    递归解析权重语法
+    支持：
+    - (word) - 权重 * 1.1
+    - (word:1.5) - 权重 1.5
+    - ((word)) - 权重 * 1.1 * 1.1 = 1.21
     """
     a = parse_parentheses(string)
     out = []
@@ -93,15 +96,11 @@ def parse_prompt_with_comfy_weights(text: str) -> List[Tuple[str, float]]:
     """
     text = escape_important(text)
     parsed = token_weights(text, 1.0)
-    # 还原转义
     result = [(unescape_important(t), w) for t, w in parsed]
     return result
 
 
 def chunk_weighted_prompt(text: str, max_length: int, tokenizer) -> List[List[Tuple[str, float]]]:
-    """
-    使用 ComfyUI 的权重解析 + 自动分块
-    """
     weighted_segments = parse_prompt_with_comfy_weights(text)
     
     chunks = []
@@ -112,19 +111,15 @@ def chunk_weighted_prompt(text: str, max_length: int, tokenizer) -> List[List[Tu
         if not segment_text.strip():
             continue
             
-        # 估算 token 长度
         tokens = tokenizer(segment_text, add_special_tokens=False)["input_ids"]
         segment_length = len(tokens)
         
-        # 如果加上这个 segment 会超出，先保存当前 chunk
         if current_length + segment_length > max_length and current_chunk:
             chunks.append(current_chunk)
             current_chunk = []
             current_length = 0
         
-        # 如果单个 segment 就超长，强制截断
         if segment_length > max_length:
-            # 逐 token 分割
             for i in range(0, segment_length, max_length):
                 chunk_tokens = tokens[i:i+max_length]
                 chunk_text = tokenizer.decode(chunk_tokens, skip_special_tokens=True)
@@ -133,7 +128,6 @@ def chunk_weighted_prompt(text: str, max_length: int, tokenizer) -> List[List[Tu
             current_chunk.append((segment_text, weight))
             current_length += segment_length
     
-    # 添加最后一个 chunk
     if current_chunk:
         chunks.append(current_chunk)
     
@@ -370,7 +364,6 @@ class LLMTokenizerComfy(comfy.sd1_clip.SDTokenizer):
             if self.start_token is not None:
                 batch.append((self.start_token, 1.0, 0))
             
-            # 处理每个 weighted segment
             for segment_text, weight in chunk:
                 # tokenize segment
                 segment_tokens = self.hf_tokenizer(
@@ -419,7 +412,7 @@ class LLMTextEncoderComfy(torch.nn.Module, comfy.sd1_clip.ClipTokenWeightEncoder
         self.target_hidden_size = target_hidden_size if target_hidden_size else self.hidden_size
         self.projection = None
         
-        # 如果需要维度投影
+        # 如果需要维度投影(神人功能XD)
         if self.hidden_size != self.target_hidden_size:
             print(f"检测到维度不匹配: {self.hidden_size} != {self.target_hidden_size}")
             print(f"创建投影层: Linear({self.hidden_size}, {self.target_hidden_size})")
@@ -566,7 +559,6 @@ class LLMCLIPLoader:
     从 Hugging Face 仓库加载任意 LLM，返回真正的 comfy.sd.CLIP 实例
     直接包装 HF 的 model 和 tokenizer，不需要转换 state_dict
     """
-    
     @classmethod
     def INPUT_TYPES(s):
         devices = ["auto", "cpu", "cuda"]
@@ -616,7 +608,7 @@ class LLMCLIPLoader:
         print(f"[LLM CLIP] Target hidden size: {target_hidden_size}")
         print(f"[LLM CLIP] Enable weights: {enable_weights}")
         
-        # 加载 HF 模型和 tokenizer (与 LLMLoader 相同逻辑)
+        # 加载 HF 模型和 tokenizer
         hf_tokenizer = AutoTokenizer.from_pretrained(model_path)
         hf_tokenizer.padding_side = "right"
         
