@@ -190,25 +190,33 @@ class LLMTextGenerator:
                 print("警告：当前为纯文本模式，所有图像输入都将被忽略。")
         
             if self.loaded_tokenizer.chat_template is not None:
-                messages = [
-                    {"role": "system", "content": system_prompt}, 
-                    {"role": "user", "content": user_prompt}
-                ]
-                inputs = self.loaded_tokenizer.apply_chat_template(
-                    messages, 
-                    add_generation_prompt=True, 
-                    tokenize=True, 
-                    return_dict=True, 
-                    return_tensors="pt"
-                ).to(self.loaded_model.device)
+                try:
+                    messages = [
+                        {"role": "system", "content": system_prompt}, 
+                        {"role": "user", "content": user_prompt}
+                    ]
+                    inputs = self.loaded_tokenizer.apply_chat_template(
+                        messages, 
+                        add_generation_prompt=True, 
+                        tokenize=True, 
+                        return_dict=True, 
+                        return_tensors="pt"
+                    ).to(self.loaded_model.device)
+                except Exception as e:
+                    print(f"chat_template 应用失败，降级到文本拼接: {e}")
+                    prompt_parts = []
+                    if system_prompt.strip():
+                        prompt_parts.append(f"{system_prompt} <Prompt Start>\n")
+                    prompt_parts.append(user_prompt)
+                    final_prompt = "".join(prompt_parts)
+                    inputs = self.loaded_tokenizer(final_prompt, return_tensors="pt").to(self.loaded_model.device)
             else:
                 prompt_parts = []
                 if system_prompt.strip():
                     prompt_parts.append(f"{system_prompt} <Prompt Start>\n")
                 prompt_parts.append(user_prompt)
                 final_prompt = "".join(prompt_parts)
-                
-                inputs = self.loaded_tokenizer(final_prompt, return_tensors="pt").to (self.loaded_model.device)
+                inputs = self.loaded_tokenizer(final_prompt, return_tensors="pt").to(self.loaded_model.device)
 
         generation_kwargs = {
             "max_new_tokens": max_new_tokens,
