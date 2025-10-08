@@ -20,7 +20,6 @@ if "LLM" not in folder_paths.folder_names_and_paths:
     folder_paths.folder_names_and_paths["LLM"] = ([llm_dir], {".safetensors", ".bin", ".pt"})
 
 def parse_parentheses(string):
-    """解析括号嵌套结构"""
     result = []
     current_item = ""
     nesting_level = 0
@@ -49,13 +48,6 @@ def parse_parentheses(string):
     return result
 
 def token_weights(string, current_weight):
-    """
-    递归解析权重语法
-    支持：
-    - (word) - 权重 * 1.1
-    - (word:1.5) - 权重 1.5
-    - ((word)) - 权重 * 1.1 * 1.1 = 1.21
-    """
     a = parse_parentheses(string)
     out = []
     for x in a:
@@ -63,10 +55,10 @@ def token_weights(string, current_weight):
         if len(x) >= 2 and x[-1] == ')' and x[0] == '(':
             x = x[1:-1]
             xx = x.rfind(":")
-            weight *= 1.1  # 默认权重倍数
+            weight *= 1.1
             if xx > 0:
                 try:
-                    weight = float(x[xx+1:])  # 显式指定权重
+                    weight = float(x[xx+1:])
                     x = x[:xx]
                 except:
                     pass
@@ -76,7 +68,6 @@ def token_weights(string, current_weight):
     return out
 
 def escape_important(text):
-    """转义"""
     text = text.replace("\\)", "\0\1")
     text = text.replace("\\(", "\0\2")
     return text
@@ -86,19 +77,11 @@ def unescape_important(text):
     text = text.replace("\0\2", "(")
     return text
 
-
 def parse_prompt_with_comfy_weights(text: str) -> List[Tuple[str, float]]:
-    """
-    (word) - 权重 * 1.1
-    (word:1.5) - 权重 1.5
-    ((word)) - 嵌套权重
-    \( \) - 转义括号
-    """
     text = escape_important(text)
     parsed = token_weights(text, 1.0)
     result = [(unescape_important(t), w) for t, w in parsed]
     return result
-
 
 def chunk_weighted_prompt(text: str, max_length: int, tokenizer) -> List[List[Tuple[str, float]]]:
     weighted_segments = parse_prompt_with_comfy_weights(text)
@@ -147,9 +130,7 @@ try:
 except AttributeError:
     print("Torch版本过旧,不支持FP8")
 
-
 def get_llm_models():
-    """扫描 models/LLM 目录下的所有文件夹"""
     llm_path = os.path.join(folder_paths.models_dir, "LLM")
     if not os.path.exists(llm_path):
         return []
@@ -157,12 +138,10 @@ def get_llm_models():
     models = []
     for item in os.listdir(llm_path):
         item_path = os.path.join(llm_path, item)
-        if os.path.isdir(item_path):
-            if os.path.exists(os.path.join(item_path, "config.json")):
-                models.append(item)
+        if os.path.isdir(item_path) and os.path.exists(os.path.join(item_path, "config.json")):
+            models.append(item)
     
     return models if models else ["(请将模型放到 models/LLM 目录)"]
-
 
 class LLMLoader:
     @classmethod
@@ -200,7 +179,7 @@ class LLMLoader:
         
         text_encoder = AutoModel.from_pretrained(
             model_path,
-            torch_dtype=dtype_torch if dtype_torch else torch.float32,
+            dtype=dtype_torch if dtype_torch else torch.float32,
             device_map=device if device != "cpu" else None,
         )
         
@@ -265,7 +244,6 @@ class LLMTextEncode:
                 return_dict=True,
             )
             
-            # 使用倒数第二层 (适用于大多数 LLM)
             hidden_states = outputs.hidden_states[-2]
             cond = hidden_states * attention_mask.unsqueeze(-1)
         
@@ -348,60 +326,48 @@ class LLMTokenizerComfy(comfy.sd1_clip.SDTokenizer):
             full_prompt = f'{self.system_prompt} <Prompt Start> {text}'
         
         if not self.enable_weights:
-            # 禁用权重：直接 tokenize，不分块
             tokens = self.hf_tokenizer(full_prompt, add_special_tokens=True)["input_ids"]
-            # 返回格式：[[(token_id, weight, word_id), ...]]
             result = [[(t, 1.0, 0) for t in tokens]]
             return result
         
-        chunks = chunk_weighted_prompt(full_prompt, self.max_length - 2, self.hf_tokenizer)  # -2 for start/end tokens
+        chunks = chunk_weighted_prompt(full_prompt, self.max_length - 2, self.hf_tokenizer)
         
         batched_tokens = []
         for chunk_idx, chunk in enumerate(chunks):
             batch = []
             
-            # 添加 start token
             if self.start_token is not None:
                 batch.append((self.start_token, 1.0, 0))
             
             for segment_text, weight in chunk:
-                # tokenize segment
                 segment_tokens = self.hf_tokenizer(
                     segment_text, 
                     add_special_tokens=False
                 )["input_ids"]
                 
-                # 添加带权重的 tokens
-                # word_id 使用 chunk_idx + 1（0 保留给特殊 token）
                 batch.extend([(t, weight, chunk_idx + 1) for t in segment_tokens])
             
-            # 添加 end token
             if self.end_token is not None:
                 batch.append((self.end_token, 1.0, 0))
             
-            # padding 到 max_length（如果需要）
             if self.pad_to_max_length and len(batch) < self.max_length:
                 batch.extend([(self.pad_token, 1.0, 0)] * (self.max_length - len(batch)))
             
             batched_tokens.append(batch)
         
-        # 如果不需要 word_ids，移除第三个元素
         if not return_word_ids:
             batched_tokens = [[(t, w) for t, w, _ in batch] for batch in batched_tokens]
         
         return batched_tokens
     
     def state_dict(self):
-        """ComfyUI 需要的方法"""
         return {}
-
 
 class LLMTextEncoderComfy(torch.nn.Module, comfy.sd1_clip.ClipTokenWeightEncoder):
     def __init__(self, hf_model, hf_tokenizer, device="cpu", dtype=None, target_hidden_size=None, model_options={}):
         torch.nn.Module.__init__(self)
         comfy.sd1_clip.ClipTokenWeightEncoder.__init__(self)
         
-        # 获取模型配置
         if hasattr(hf_model, 'config'):
             self.num_layers = getattr(hf_model.config, 'num_hidden_layers', 26)
             self.hidden_size = getattr(hf_model.config, 'hidden_size', 2304)
@@ -412,28 +378,34 @@ class LLMTextEncoderComfy(torch.nn.Module, comfy.sd1_clip.ClipTokenWeightEncoder
         self.target_hidden_size = target_hidden_size if target_hidden_size else self.hidden_size
         self.projection = None
         
-        # 如果需要维度投影(神人功能XD)
         if self.hidden_size != self.target_hidden_size:
             print(f"检测到维度不匹配: {self.hidden_size} != {self.target_hidden_size}")
             print(f"创建投影层: Linear({self.hidden_size}, {self.target_hidden_size})")
             self.projection = torch.nn.Linear(self.hidden_size, self.target_hidden_size, bias=False)
+            
             with torch.no_grad():
                 if self.hidden_size < self.target_hidden_size:
                     self.projection.weight[:self.hidden_size, :] = torch.eye(self.hidden_size)
                 else:
-                    torch.nn.init.orthogonal_(self.projection.weight)
+                    if dtype == torch.bfloat16:
+                        orig_dtype = self.projection.weight.dtype
+                        self.projection.weight.data = self.projection.weight.data.to(torch.float32)
+                        torch.nn.init.orthogonal_(self.projection.weight)
+                        self.projection.weight.data = self.projection.weight.data.to(orig_dtype)
+                    else:
+                        torch.nn.init.orthogonal_(self.projection.weight)
+            
             self.projection = self.projection.to(device)
             if dtype:
                 self.projection = self.projection.to(dtype)
         
         self.hf_model = hf_model
         self.hf_tokenizer = hf_tokenizer
-        self.transformer = hf_model  # SDClipModel 兼容
+        self.transformer = hf_model
         self.device = device
         self.dtype = dtype
         self.dtypes = [dtype] if dtype else [torch.float32]
         
-        # CLIP 标准属性
         self.max_length = 512
         self.layer = "hidden"
         self.layer_idx = -2
@@ -448,7 +420,6 @@ class LLMTextEncoderComfy(torch.nn.Module, comfy.sd1_clip.ClipTokenWeightEncoder
         self.operations = model_options.get("custom_operations", comfy.ops.manual_cast)
     
     def _get_special_tokens(self):
-        """从 tokenizer 自动获取 special tokens"""
         special_tokens = {}
         
         if hasattr(self.hf_tokenizer, 'bos_token_id') and self.hf_tokenizer.bos_token_id is not None:
@@ -468,19 +439,16 @@ class LLMTextEncoderComfy(torch.nn.Module, comfy.sd1_clip.ClipTokenWeightEncoder
         return special_tokens
     
     def freeze(self):
-        """冻结模型参数"""
         self.transformer = self.transformer.eval()
         for param in self.parameters():
             param.requires_grad = False
     
     def reset_clip_options(self):
-        """重置 CLIP 选项"""
         self.layer = self.options_default[0]
         self.layer_idx = self.options_default[1]
         self.return_projected_pooled = self.options_default[2]
     
     def set_clip_options(self, options):
-        """设置 CLIP 选项 - layer 选择"""
         layer_idx = options.get("layer", self.layer_idx)
         self.return_projected_pooled = options.get("projected_pooled", self.return_projected_pooled)
         
@@ -492,19 +460,15 @@ class LLMTextEncoderComfy(torch.nn.Module, comfy.sd1_clip.ClipTokenWeightEncoder
             self.layer_idx = layer_idx
     
     def gen_empty_tokens(self, special_tokens, length):
-        """生成空 token 序列"""
         return comfy.sd1_clip.gen_empty_tokens(special_tokens, length)
     
     def state_dict(self):
-        """返回模型的 state_dict"""
         return self.hf_model.state_dict()
     
     def load_state_dict(self, state_dict):
-        """加载 state_dict"""
         return self.hf_model.load_state_dict(state_dict, strict=False)
     
     def to(self, device):
-        """移动模型到指定设备"""
         self.hf_model = self.hf_model.to(device)
         if self.projection is not None:
             self.projection = self.projection.to(device)
@@ -512,20 +476,17 @@ class LLMTextEncoderComfy(torch.nn.Module, comfy.sd1_clip.ClipTokenWeightEncoder
         return self
     
     def named_modules(self):
-        """返回所有子模块"""
         return self.hf_model.named_modules()
     
     def parameters(self):
-        """返回模型参数"""
         return self.hf_model.parameters()
     
     def named_parameters(self):
-        """返回模型参数（带名称）"""
         return self.hf_model.named_parameters()
     
     def encode(self, tokens_list):
         input_ids = torch.tensor(tokens_list, dtype=torch.long).to(self.hf_model.device)
-        attention_mask = (input_ids != self.special_tokens.get("pad", 0)).long()
+        attention_mask = (input_ids != self.special_tokens.get("pad", 0)).long().to(input_ids.device)
         
         with torch.no_grad():
             outputs = self.hf_model(
@@ -539,14 +500,12 @@ class LLMTextEncoderComfy(torch.nn.Module, comfy.sd1_clip.ClipTokenWeightEncoder
 
             cond = hidden_states * attention_mask.unsqueeze(-1)
             
-            # 维度投影
             if self.projection is not None:
                 original_shape = cond.shape
                 cond = self.projection(cond)
                 print(f"应用维度投影: {original_shape} -> {cond.shape}")
         
-        # 计算 pooled（简单平均）
-        mask_expanded = attention_mask.unsqueeze(-1).expand(cond.size()).float()
+        mask_expanded = attention_mask.unsqueeze(-1).expand(cond.size()).float().to(cond.device)
         sum_embeddings = torch.sum(cond * mask_expanded, 1)
         sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
         pooled = sum_embeddings / sum_mask
@@ -555,10 +514,6 @@ class LLMTextEncoderComfy(torch.nn.Module, comfy.sd1_clip.ClipTokenWeightEncoder
 
 
 class LLMCLIPLoader:
-    """
-    从 Hugging Face 仓库加载任意 LLM，返回真正的 comfy.sd.CLIP 实例
-    直接包装 HF 的 model 和 tokenizer，不需要转换 state_dict
-    """
     @classmethod
     def INPUT_TYPES(s):
         devices = ["auto", "cpu", "cuda"]
@@ -572,18 +527,18 @@ class LLMCLIPLoader:
                     "multiline": True,
                     "default": "You are an assistant designed to generate high-quality images with the highest degree of image-text alignment based on textual prompts."
                 }),
-                "device": (devices, {"default": "cpu"}),
-                "dtype": (list(DTYPES.keys()), {"default": "default"}),
+                "device": (devices, {"default": "cuda"}),
+                "dtype": (list(DTYPES.keys()), {"default": "FP16"}),
                 "target_hidden_size": ("INT", {
                     "default": 2304, 
                     "min": 512, 
                     "max": 8192, 
                     "step": 128,
-                    "tooltip": "目标隐藏层大小。Gemma-2 9B=2304, Qwen-3=1024, 如果与模型不匹配将自动添加投影层"
+                    "tooltip": "目标隐藏层大小。Gemma-2 2B=2304, Qwen-3=1024"
                 }),
                 "enable_weights": ("BOOLEAN", {
                     "default": True,
-                    "tooltip": "启用权重功能：支持 (word:1.5) 语法和超长提示词自动分批。默认关闭以保持与原版 SPieceTokenizer 一致"
+                    "tooltip": "启用权重功能：支持 (word:1.5) 语法和超长提示词自动分批"
                 }),
                 "force_offload": ("BOOLEAN", {
                     "default": True,
@@ -597,7 +552,6 @@ class LLMCLIPLoader:
     FUNCTION = "load_clip"
     CATEGORY = "LLM/text encoder"
     TITLE = "Load LLM as CLIP (Universal)"
-    DESCRIPTION = "从 HF 仓库加载任意 LLM，输出真正的 ComfyUI CLIP 接口"
 
     def load_clip(self, model_folder, system_prompt, device, dtype, target_hidden_size=2304, enable_weights=False, force_offload=True):
         dtype_torch = DTYPES[dtype]
@@ -617,21 +571,35 @@ class LLMCLIPLoader:
         hf_tokenizer = AutoTokenizer.from_pretrained(model_path)
         hf_tokenizer.padding_side = "right"
         
+        # 明确指定设备加载模型
+        device_map = None
+        if device != "auto" and device != "cpu":
+            device_map = {device: 0}
+            torch_device = torch.device(device)
+        elif device == "cpu":
+            torch_device = torch.device("cpu")
+        else:  # auto
+            torch_device = comfy.model_management.text_encoder_device()
+            device = torch_device.type
+            if torch_device.index is not None:
+                device += f":{torch_device.index}"
+        
+        # 先在CPU加载模型，再转移到目标设备，确保参数完整性
         hf_model = AutoModel.from_pretrained(
             model_path,
-            torch_dtype=dtype_torch if dtype_torch else torch.float32,
-            device_map=device if device != "cpu" else None,
+            dtype=dtype_torch if dtype_torch else torch.float32,
+            device_map="cpu",  # 先在CPU完整加载
         )
         
         hf_model.eval()
         hf_model.requires_grad_(False)
         
-        # 确定设备
-        original_device = torch.device(device) if device not in ["auto", "cpu"] else comfy.model_management.text_encoder_device()
-        offload_device = torch.device("cpu")
+        hf_model = hf_model.to(torch_device)
+        if dtype_torch:
+            hf_model = hf_model.to(dtype_torch)
         
         if force_offload and device != "cpu":
-            class OffloadableModelWrapper(torch.nn.Module):
+            class SafeOffloadModelWrapper(torch.nn.Module):
                 def __init__(self, model, load_device, offload_device, dtype):
                     super().__init__()
                     self.model = model.to(offload_device)
@@ -639,9 +607,31 @@ class LLMCLIPLoader:
                     self.offload_device = offload_device
                     self.dtype = dtype
                     self._is_loaded = False
+                    self.original_device = load_device
+
+                def _ensure_model_on_device(self):
+                    """确保模型在正确的设备上，并验证所有参数都在该设备"""
+                    if not self._is_loaded:
+                        self.model = self.model.to(self.load_device)
+                        if self.dtype:
+                            self.model = self.model.to(self.dtype)
+                        
+                        wrong_device_params = []
+                        for name, param in self.model.named_parameters():
+                            if param.device != self.load_device:
+                                wrong_device_params.append(name)
+                        
+                        if wrong_device_params:
+                            print(f"[LLM CLIP] 发现 {len(wrong_device_params)} 个参数在错误的设备上，正在修复...")
+                            for name, param in self.model.named_parameters():
+                                if param.device != self.load_device:
+                                    param.data = param.data.to(self.load_device)
+                                    if self.dtype:
+                                        param.data = param.data.to(self.dtype)
+                        
+                        self._is_loaded = True
 
                 def forward(self, *args, **kwargs):
-                    # 确保所有输入张量都移动到模型加载设备
                     args = [
                         arg.to(self.load_device) if isinstance(arg, torch.Tensor) else arg
                         for arg in args
@@ -652,41 +642,38 @@ class LLMCLIPLoader:
                         for k, v in kwargs.items()
                     }
                     
-                    if not self._is_loaded:
-                        self.model = self.model.to(self.load_device)
-                        if self.dtype:
-                            self.model = self.model.to(self.dtype)
-                        self._is_loaded = True
+                    self._ensure_model_on_device()
+                    
+                    if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
+                        first_layer = self.model.model.layers[0]
+                        if hasattr(first_layer, 'self_attn') and hasattr(first_layer.self_attn, 'q_proj'):
+                            if first_layer.self_attn.q_proj.weight.device != self.load_device:
+                                print(f"[LLM CLIP] q_proj 层在错误设备上，正在纠正...")
+                                first_layer.self_attn.q_proj = first_layer.self_attn.q_proj.to(self.load_device)
                     
                     result = self.model(*args, **kwargs)
 
-                    # 卸载模型到CPU，但保持输出结果在GPU上
+                    # 卸载模型到CPU，但保持输出在GPU上
                     self.model = self.model.to(self.offload_device)
                     self._is_loaded = False
                     
                     return result
                 
                 def __getattr__(self, name):
-                    if name in ['model', 'load_device', 'offload_device', 'dtype', '_is_loaded']:
+                    if name in ['model', 'load_device', 'offload_device', 'dtype', '_is_loaded', 'original_device']:
                         return super().__getattr__(name)
                     return getattr(self.model, name)
             
-            hf_model = OffloadableModelWrapper(
+            hf_model = SafeOffloadModelWrapper(
                 hf_model, 
-                original_device, 
-                offload_device,
+                torch_device, 
+                torch.device("cpu"),
                 dtype_torch
             )
-        else:
-            if device != "auto" and device != "cpu":
-                hf_model = hf_model.to(device)
-            
-            if dtype_torch and device != "auto":
-                hf_model = hf_model.to(dtype_torch)
         
         class FixedLLMTextEncoderComfy(LLMTextEncoderComfy):
             def encode(self, tokens_list):
-                target_device = self.device
+                target_device = torch_device
                 if hasattr(self.hf_model, 'device'):
                     target_device = self.hf_model.device
                 elif hasattr(self.hf_model, 'load_device'):
@@ -704,23 +691,39 @@ class LLMCLIPLoader:
                     )
                     
                     hidden_states = outputs.hidden_states[-2].to(input_ids.device)
-
                     cond = hidden_states * attention_mask.unsqueeze(-1)
 
                     # 维度投影(神人功能XD)
                     if self.projection is not None:
+                        self.projection = self.projection.to(cond.device)
                         original_shape = cond.shape
-                        proj_device = self.projection.weight.device
-                        cond = self.projection(cond.to(proj_device))
+                        cond = self.projection(cond)
                         print(f"应用维度投影: {original_shape} -> {cond.shape}")
+                    else:
+                        if cond.shape[-1] != self.target_hidden_size:
+                            print(f"[LLM CLIP] 警告: 维度不匹配但未创建投影层，自动创建...")
+                            self.projection = torch.nn.Linear(cond.shape[-1], self.target_hidden_size, bias=False).to(cond.device, dtype=cond.dtype)
+                            
+                            with torch.no_grad():
+                                if cond.dtype == torch.bfloat16:
+                                    orig_dtype = self.projection.weight.dtype
+                                    self.projection.weight.data = self.projection.weight.data.to(torch.float32)
+                                    torch.nn.init.orthogonal_(self.projection.weight)
+                                    self.projection.weight.data = self.projection.weight.data.to(orig_dtype)
+                                else:
+                                    torch.nn.init.orthogonal_(self.projection.weight)
+                            
+                            original_shape = cond.shape
+                            cond = self.projection(cond)
+                            print(f"[LLM CLIP] 自动创建并应用投影层: {original_shape} -> {cond.shape}")
                 
-                # 计算 pooled（简单平均）
-                mask_expanded = attention_mask.unsqueeze(-1).expand(cond.size()).float()
+                # 确保所有张量在同一设备上
+                mask_expanded = attention_mask.unsqueeze(-1).expand(cond.size()).float().to(cond.device)
                 sum_embeddings = torch.sum(cond * mask_expanded, 1)
                 sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
                 pooled = sum_embeddings / sum_mask
                 
-                return cond, pooled, {"attention_mask": attention_mask}
+                return cond, pooled, {"attention_mask": attention_mask.to(cond.device)}
         
         comfy_tokenizer = LLMTokenizerComfy(
             hf_tokenizer, 
@@ -728,11 +731,11 @@ class LLMCLIPLoader:
             max_length=9999999,
             enable_weights=enable_weights
         )
-        # 使用修复后的文本编码器
+        
         comfy_text_encoder = FixedLLMTextEncoderComfy(
             hf_model, 
             hf_tokenizer, 
-            device=device, 
+            device=torch_device, 
             dtype=dtype_torch,
             target_hidden_size=target_hidden_size
         )
@@ -742,7 +745,7 @@ class LLMCLIPLoader:
         clip.tokenizer = comfy_tokenizer
         
         # 设置 patcher
-        load_device = original_device
+        load_device = torch_device
         offload_device = comfy.model_management.text_encoder_offload_device()
         
         clip.patcher = comfy.model_patcher.ModelPatcher(
@@ -762,7 +765,6 @@ class LLMCLIPLoader:
         import types
         CLIP_class = comfy.sd.CLIP
         
-        # 绑定所有必需的方法
         clip.load_model = types.MethodType(CLIP_class.load_model, clip)
         clip.clone = types.MethodType(CLIP_class.clone, clip)
         clip.add_patches = types.MethodType(CLIP_class.add_patches, clip)
@@ -776,11 +778,9 @@ class LLMCLIPLoader:
         clip.get_sd = types.MethodType(CLIP_class.get_sd, clip)
         clip.get_key_patches = types.MethodType(CLIP_class.get_key_patches, clip)
         
-        # encode_from_tokens_scheduled 如果存在也绑定
         if hasattr(CLIP_class, 'encode_from_tokens_scheduled'):
             clip.encode_from_tokens_scheduled = types.MethodType(CLIP_class.encode_from_tokens_scheduled, clip)
         
         print(f"[LLM CLIP] Loaded as comfy.sd.CLIP!")
         
         return (clip,)
-    
