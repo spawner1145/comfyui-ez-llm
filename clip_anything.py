@@ -585,6 +585,10 @@ class LLMCLIPLoader:
                     "default": True,
                     "tooltip": "启用权重功能：支持 (word:1.5) 语法和超长提示词自动分批。默认关闭以保持与原版 SPieceTokenizer 一致"
                 }),
+                "force_offload": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "强制模型在不使用时卸载到CPU，减少显存占用"
+                }),
             }
         }
     
@@ -595,7 +599,7 @@ class LLMCLIPLoader:
     TITLE = "Load LLM as CLIP (Universal)"
     DESCRIPTION = "从 HF 仓库加载任意 LLM，输出真正的 ComfyUI CLIP 接口"
 
-    def load_clip(self, model_folder, system_prompt, device, dtype, target_hidden_size=2304, enable_weights=False):
+    def load_clip(self, model_folder, system_prompt, device, dtype, target_hidden_size=2304, enable_weights=False, force_offload=True):
         dtype_torch = DTYPES[dtype]
         if device == "cpu" and dtype_torch not in [None, torch.float32]:
             raise ValueError(f"CPU 只支持 FP32 或 default! 当前: {dtype}")
@@ -607,8 +611,8 @@ class LLMCLIPLoader:
         print(f"[LLM CLIP] Loading from {model_path}...")
         print(f"[LLM CLIP] Target hidden size: {target_hidden_size}")
         print(f"[LLM CLIP] Enable weights: {enable_weights}")
+        print(f"[LLM CLIP] Force offload: {force_offload}")
         
-        # 加载 HF 模型和 tokenizer
         hf_tokenizer = AutoTokenizer.from_pretrained(model_path)
         hf_tokenizer.padding_side = "right"
         
@@ -620,20 +624,105 @@ class LLMCLIPLoader:
         
         hf_model.eval()
         hf_model.requires_grad_(False)
-        if device != "auto" and device != "cpu":
-            hf_model = hf_model.to(device)
         
-        if dtype_torch and device != "auto":
-            hf_model = hf_model.to(dtype_torch)
+        # 确定设备
+        original_device = torch.device(device) if device not in ["auto", "cpu"] else comfy.model_management.text_encoder_device()
+        offload_device = torch.device("cpu")
         
-        # 包装为 ComfyUI 接口
+        if force_offload and device != "cpu":
+            class OffloadableModelWrapper(torch.nn.Module):
+                def __init__(self, model, load_device, offload_device, dtype):
+                    super().__init__()
+                    self.model = model.to(offload_device)
+                    self.load_device = load_device
+                    self.offload_device = offload_device
+                    self.dtype = dtype
+                    self._is_loaded = False
+
+                def forward(self, *args, **kwargs):
+                    # 确保所有输入张量都移动到模型加载设备
+                    args = [
+                        arg.to(self.load_device) if isinstance(arg, torch.Tensor) else arg
+                        for arg in args
+                    ]
+                    
+                    kwargs = {
+                        k: v.to(self.load_device) if isinstance(v, torch.Tensor) else v
+                        for k, v in kwargs.items()
+                    }
+                    
+                    if not self._is_loaded:
+                        self.model = self.model.to(self.load_device)
+                        if self.dtype:
+                            self.model = self.model.to(self.dtype)
+                        self._is_loaded = True
+                    
+                    result = self.model(*args, **kwargs)
+
+                    # 卸载模型到CPU，但保持输出结果在GPU上
+                    self.model = self.model.to(self.offload_device)
+                    self._is_loaded = False
+                    
+                    return result
+                
+                def __getattr__(self, name):
+                    if name in ['model', 'load_device', 'offload_device', 'dtype', '_is_loaded']:
+                        return super().__getattr__(name)
+                    return getattr(self.model, name)
+            
+            # 使用包装器包装模型
+            hf_model = OffloadableModelWrapper(
+                hf_model, 
+                original_device, 
+                offload_device,
+                dtype_torch
+            )
+        else:
+            if device != "auto" and device != "cpu":
+                hf_model = hf_model.to(device)
+            
+            if dtype_torch and device != "auto":
+                hf_model = hf_model.to(dtype_torch)
+        
+        # 自定义文本编码器，确保所有张量在同一设备
+        class FixedLLMTextEncoderComfy(LLMTextEncoderComfy):
+            def encode(self, tokens_list):
+                input_ids = torch.tensor(tokens_list, dtype=torch.long).to(self.hf_model.device if hasattr(self.hf_model, 'device') else self.device)
+                attention_mask = (input_ids != self.special_tokens.get("pad", 0)).long().to(input_ids.device)
+                
+                with torch.no_grad():
+                    outputs = self.hf_model(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    
+                    hidden_states = outputs.hidden_states[-2].to(input_ids.device)
+                    cond = hidden_states * attention_mask.unsqueeze(-1)
+                    
+                    # 维度投影(神人功能XD)
+                    if self.projection is not None:
+                        original_shape = cond.shape
+                        cond = self.projection(cond.to(self.projection.device))
+                        print(f"应用维度投影: {original_shape} -> {cond.shape}")
+                
+                # 计算 pooled（简单平均）
+                mask_expanded = attention_mask.unsqueeze(-1).expand(cond.size()).float()
+                sum_embeddings = torch.sum(cond * mask_expanded, 1)
+                sum_mask = torch.clamp(mask_expanded.sum(1), min=1e-9)
+                pooled = sum_embeddings / sum_mask
+                
+                return cond, pooled, {"attention_mask": attention_mask}
+        
         comfy_tokenizer = LLMTokenizerComfy(
             hf_tokenizer, 
             system_prompt, 
             max_length=9999999,
             enable_weights=enable_weights
         )
-        comfy_text_encoder = LLMTextEncoderComfy(
+        # 使用修复后的文本编码器
+        comfy_text_encoder = FixedLLMTextEncoderComfy(
             hf_model, 
             hf_tokenizer, 
             device=device, 
@@ -646,7 +735,7 @@ class LLMCLIPLoader:
         clip.tokenizer = comfy_tokenizer
         
         # 设置 patcher
-        load_device = torch.device(device) if device not in ["auto", "cpu"] else comfy.model_management.text_encoder_device()
+        load_device = original_device
         offload_device = comfy.model_management.text_encoder_offload_device()
         
         clip.patcher = comfy.model_patcher.ModelPatcher(
@@ -664,8 +753,6 @@ class LLMCLIPLoader:
         # 直接从 comfy.sd.CLIP 类复制方法（防止写石山这一块）
         # 这样确保 100% 兼容，因为使用的是完全相同的实现
         import types
-        
-        # 从 comfy.sd.CLIP 类获取所有需要的方法
         CLIP_class = comfy.sd.CLIP
         
         # 绑定所有必需的方法
@@ -689,3 +776,4 @@ class LLMCLIPLoader:
         print(f"[LLM CLIP] Loaded as comfy.sd.CLIP!")
         
         return (clip,)
+    
