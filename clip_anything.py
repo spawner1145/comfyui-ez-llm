@@ -613,6 +613,7 @@ class LLMCLIPLoader:
         print(f"[LLM CLIP] Enable weights: {enable_weights}")
         print(f"[LLM CLIP] Force offload: {force_offload}")
         
+        # 加载 HF 模型和 tokenizer
         hf_tokenizer = AutoTokenizer.from_pretrained(model_path)
         hf_tokenizer.padding_side = "right"
         
@@ -670,7 +671,6 @@ class LLMCLIPLoader:
                         return super().__getattr__(name)
                     return getattr(self.model, name)
             
-            # 使用包装器包装模型
             hf_model = OffloadableModelWrapper(
                 hf_model, 
                 original_device, 
@@ -684,10 +684,15 @@ class LLMCLIPLoader:
             if dtype_torch and device != "auto":
                 hf_model = hf_model.to(dtype_torch)
         
-        # 自定义文本编码器，确保所有张量在同一设备
         class FixedLLMTextEncoderComfy(LLMTextEncoderComfy):
             def encode(self, tokens_list):
-                input_ids = torch.tensor(tokens_list, dtype=torch.long).to(self.hf_model.device if hasattr(self.hf_model, 'device') else self.device)
+                target_device = self.device
+                if hasattr(self.hf_model, 'device'):
+                    target_device = self.hf_model.device
+                elif hasattr(self.hf_model, 'load_device'):
+                    target_device = self.hf_model.load_device
+                
+                input_ids = torch.tensor(tokens_list, dtype=torch.long).to(target_device)
                 attention_mask = (input_ids != self.special_tokens.get("pad", 0)).long().to(input_ids.device)
                 
                 with torch.no_grad():
@@ -699,12 +704,14 @@ class LLMCLIPLoader:
                     )
                     
                     hidden_states = outputs.hidden_states[-2].to(input_ids.device)
+
                     cond = hidden_states * attention_mask.unsqueeze(-1)
-                    
+
                     # 维度投影(神人功能XD)
                     if self.projection is not None:
                         original_shape = cond.shape
-                        cond = self.projection(cond.to(self.projection.device))
+                        proj_device = self.projection.weight.device
+                        cond = self.projection(cond.to(proj_device))
                         print(f"应用维度投影: {original_shape} -> {cond.shape}")
                 
                 # 计算 pooled（简单平均）
