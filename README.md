@@ -11,7 +11,7 @@
 启动以后这么用：
 <img height="1074" alt="image" src="imgs/4e7d10e9c985e091e7d89cf2bf6918bd.png" />
 
-这边的model_mode三个如果是gemma3系列直接选auto，兼容了gemma3全系列，别的模型(比如gemma2,llama,qwen这种就选text，兼容了所有的纯文本模型，多模态目前只兼容gemma3)
+这边的model_mode三个如果是gemma3系列直接选auto，兼容了gemma3全系列，别的模型(比如gemma2,llama,qwen这种纯文本模型就选text，如果是有视觉能力的就选multimodal)
 
 gemma3 1b以上的可以输入图片，这样搞:
 <img height="1051" alt="image" src="imgs/1cd4a646-a29e-420f-8133-368df2551d36.png" />
