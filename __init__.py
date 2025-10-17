@@ -144,7 +144,7 @@ class LLMModelLoader:
         return {
             "required": {
                 "model_name": (llm_model_list, {"tooltip": "选择要加载的LLM模型文件夹。/ Select the LLM model folder to load."}),
-                "model_mode": (["auto", "text", "multimodal"], {"default": "auto", "tooltip": "设置模型加载模式：'auto'自动检测，'text'纯文本，'multimodal'多模态。/ Set model loading mode: 'auto', 'text', or 'multimodal'."}),
+                "model_mode": (["text", "multimodal"], {"default": "text", "tooltip": "'text'纯文本，'multimodal'多模态。/ Set model loading mode: 'text' or 'multimodal'."}),
             }
         }
 
@@ -157,9 +157,7 @@ class LLMModelLoader:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         load_as_vision = False
-        if model_mode == "auto":
-            load_as_vision = "1b" not in model_name
-        elif model_mode == "multimodal":
+        if model_mode == "multimodal":
             load_as_vision = True
         else:
             load_as_vision = False
