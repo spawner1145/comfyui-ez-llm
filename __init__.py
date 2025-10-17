@@ -512,5 +512,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 
     "LLMLoader": "LLM Loader (Text Encode)",
     "LLMTextEncode": "LLM Text Encode",
-    "LLMCLIPLoader": "Load LLM as CLIP (Universal)",
+    "LLMCLIPLoader": "Load LLM as CLIP",
 }
