@@ -6,7 +6,7 @@ from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM, 
     AutoProcessor, 
-    Gemma3ForConditionalGeneration # AutoModelForConditionalGeneration
+    AutoModelForImageTextToText
 )
 import folder_paths
 import comfy.utils
@@ -153,7 +153,7 @@ class LLMTextGenerator:
                 if load_as_vision:
                     self.loaded_processor = AutoProcessor.from_pretrained(model_path)
                     pbar.update(1)
-                    self.loaded_model = Gemma3ForConditionalGeneration.from_pretrained(model_path, device_map="auto").eval()
+                    self.loaded_model = AutoModelForImageTextToText.from_pretrained(model_path, device_map="auto").eval()
                     self.current_model_type = 'vision'
                 else:
                     self.loaded_tokenizer = AutoTokenizer.from_pretrained(model_path)
