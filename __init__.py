@@ -145,6 +145,10 @@ class LLMModelLoader:
             "required": {
                 "model_name": (llm_model_list, {"tooltip": "选择要加载的LLM模型文件夹。/ Select the LLM model folder to load."}),
                 "model_mode": (["text", "multimodal"], {"default": "text", "tooltip": "'text'纯文本，'multimodal'多模态。/ Set model loading mode: 'text' or 'multimodal'."}),
+                "force_offload": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "强制模型在不使用时卸载到CPU，减少显存占用 / Force offload model to CPU when not in use to reduce VRAM usage"
+                }),
             }
         }
 
@@ -153,8 +157,14 @@ class LLMModelLoader:
     FUNCTION = "load_model"
     CATEGORY = "LLM"
 
-    def load_model(self, model_name: str, model_mode: str):
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    def load_model(self, model_name: str, model_mode: str, force_offload: bool = True):
+        # 确定设备
+        if torch.cuda.is_available():
+            device = "cuda"
+            torch_device = torch.device("cuda")
+        else:
+            device = "cpu"
+            torch_device = torch.device("cpu")
 
         load_as_vision = False
         if model_mode == "multimodal":
@@ -162,7 +172,7 @@ class LLMModelLoader:
         else:
             load_as_vision = False
 
-        config_str = f"{model_name}{model_mode}{load_as_vision}"
+        config_str = f"{model_name}{model_mode}{load_as_vision}{force_offload}"
         current_hash = hash(config_str)
 
         if self.cached_instance and self.cached_config_hash == current_hash:
@@ -195,10 +205,118 @@ class LLMModelLoader:
                 'model_type': 'vision' if load_as_vision else 'text'
             }
             
+            # 定义安全卸载模型的包装类
+            class SafeOffloadModelWrapper(torch.nn.Module):
+                def __init__(self, model, load_device, offload_device, dtype=None):
+                    super().__init__()
+                    self.model = model.to(offload_device)
+                    self.load_device = load_device
+                    self.offload_device = offload_device
+                    self.dtype = dtype
+                    self._is_loaded = False
+
+                def _ensure_model_on_device(self):
+                    """确保模型在正确的设备上，并验证所有参数都在该设备"""
+                    if not self._is_loaded:
+                        self.model = self.model.to(self.load_device)
+                        if self.dtype:
+                            self.model = self.model.to(self.dtype)
+                        
+                        # 检查并修复错误设备的参数
+                        wrong_device_params = []
+                        for name, param in self.model.named_parameters():
+                            if param.device != self.load_device:
+                                wrong_device_params.append(name)
+                        
+                        if wrong_device_params:
+                            print(f"[LLM Offload] 正在移动 {len(wrong_device_params)} 个参数到 {self.load_device} ...")
+                            for name, param in self.model.named_parameters():
+                                if param.device != self.load_device:
+                                    param.data = param.data.to(self.load_device)
+                                    if self.dtype:
+                                        param.data = param.data.to(self.dtype)
+                        
+                        self._is_loaded = True
+
+                def forward(self, *args, **kwargs):
+                    # 将输入张量转移到目标设备
+                    args = [
+                        arg.to(self.load_device) if isinstance(arg, torch.Tensor) else arg
+                        for arg in args
+                    ]
+                    
+                    kwargs = {
+                        k: v.to(self.load_device) if isinstance(v, torch.Tensor) else v
+                        for k, v in kwargs.items()
+                    }
+                    
+                    # 确保模型在正确设备上
+                    self._ensure_model_on_device()
+                    
+                    # 执行模型前向传播（generate方法也会调用forward）
+                    result = self.model(*args, **kwargs)
+
+                    # 卸载模型到CPU，但保持输出在GPU上
+                    if force_offload:
+                        self.model = self.model.to(self.offload_device)
+                        self._is_loaded = False
+                    
+                    return result
+                
+                def generate(self, *args, **kwargs):
+                    """重写generate方法，适配LLM的生成逻辑"""
+                    # 将输入张量转移到目标设备
+                    args = [
+                        arg.to(self.load_device) if isinstance(arg, torch.Tensor) else arg
+                        for arg in args
+                    ]
+                    
+                    kwargs = {
+                        k: v.to(self.load_device) if isinstance(v, torch.Tensor) else v
+                        for k, v in kwargs.items()
+                    }
+                    
+                    # 确保模型在正确设备上
+                    self._ensure_model_on_device()
+                    
+                    # 执行生成
+                    result = self.model.generate(*args, **kwargs)
+
+                    # 卸载模型到CPU
+                    self.model = self.model.to(self.offload_device)
+                    self._is_loaded = False
+                    
+                    return result
+                
+                def __getattr__(self, name):
+                    """代理访问原始模型的属性和方法"""
+                    if name in ['model', 'load_device', 'offload_device', 'dtype', '_is_loaded']:
+                        return super().__getattr__(name)
+                    return getattr(self.model, name)
+            
             if load_as_vision:
                 instance['processor'] = AutoProcessor.from_pretrained(model_path)
                 pbar.update(1)
-                instance['model'] = AutoModelForImageTextToText.from_pretrained(model_path, device_map="auto").eval()
+                # 先在CPU完整加载模型
+                raw_model = AutoModelForImageTextToText.from_pretrained(
+                    model_path, 
+                    device_map="cpu",
+                    torch_dtype=torch.float16 if device == "cuda" else torch.float32
+                ).eval()
+                
+                # 如果启用强制卸载且不是CPU模式，包装模型
+                if force_offload and device != "cpu":
+                    wrapped_model = SafeOffloadModelWrapper(
+                        raw_model,
+                        torch_device,
+                        torch.device("cpu"),
+                        dtype=torch.float16 if device == "cuda" else torch.float32
+                    )
+                    instance['model'] = wrapped_model
+                    print(f"[LLM Offload] 多模态模型已启用强制卸载功能")
+                else:
+                    # 直接转移到目标设备
+                    instance['model'] = raw_model.to(torch_device)
             else:
                 instance['tokenizer'] = AutoTokenizer.from_pretrained(model_path)
                 if instance['tokenizer'].chat_template is None:
@@ -206,7 +324,27 @@ class LLMModelLoader:
                 else:
                     print(f"模型 {model_name} 已检测到chat_template，将使用模板模式")
                 pbar.update(1)
-                instance['model'] = AutoModelForCausalLM.from_pretrained(model_path, device_map="auto").eval()
+                
+                # 先在CPU完整加载模型
+                raw_model = AutoModelForCausalLM.from_pretrained(
+                    model_path, 
+                    device_map="cpu",
+                    torch_dtype=torch.float16 if device == "cuda" else torch.float32
+                ).eval()
+                
+                # 如果启用强制卸载且不是CPU模式，包装模型
+                if force_offload and device != "cpu":
+                    wrapped_model = SafeOffloadModelWrapper(
+                        raw_model,
+                        torch_device,
+                        torch.device("cpu"),
+                        dtype=torch.float16 if device == "cuda" else torch.float32
+                    )
+                    instance['model'] = wrapped_model
+                    print(f"[LLM Offload] 文本模型已启用强制卸载功能")
+                else:
+                    # 直接转移到目标设备
+                    instance['model'] = raw_model.to(torch_device)
             
             pbar.update(1)
             print(f"模型 {model_name} 加载成功。")
