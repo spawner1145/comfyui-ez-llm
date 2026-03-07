@@ -14,6 +14,7 @@ from typing import Optional, Union, Dict, List
 import json
 import io
 import base64
+import inspect
 from .clip_anything import LLMLoader, LLMTextEncode, LLMCLIPLoader
 
 llm_base_dir = os.path.join(folder_paths.models_dir, 'LLM')
@@ -56,6 +57,25 @@ else:
         print(f"错误：无法读取LLM模型目录 {llm_base_dir}。")
         print(e)
         llm_model_list = ["读取目录出错"]
+
+
+def apply_chat_template_with_optional_thinking(chat_template_owner, messages, enable_thinking, **kwargs):
+    apply_chat_template = getattr(chat_template_owner, "apply_chat_template")
+    supports_enable_thinking = False
+
+    try:
+        signature = inspect.signature(apply_chat_template)
+        supports_enable_thinking = "enable_thinking" in signature.parameters
+    except (TypeError, ValueError):
+        supports_enable_thinking = False
+
+    if supports_enable_thinking:
+        return apply_chat_template(messages, enable_thinking=enable_thinking, **kwargs)
+
+    if enable_thinking:
+        print("警告：当前 transformers 版本或处理器不支持 enable_thinking 参数，已自动回退。")
+
+    return apply_chat_template(messages, **kwargs)
 
 class LLMImageEncoder:
     @classmethod
@@ -379,6 +399,7 @@ class LLMTextGenerator:
                 
                 "num_beams": ("INT", {"default": 1, "min": 1, "max": 16, "step": 1, "tooltip": "集束搜索的光束数。大于1启用，速度变慢但质量可能更高。/ Number of beams for beam search. >1 enables it, which is slower but may yield higher quality."}),
                 "length_penalty": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.05, "tooltip": "长度惩罚因子，仅在num_beams>1时生效。/ Length penalty factor, only effective when num_beams > 1."}),
+                "enable_thinking": ("BOOLEAN", {"default": False, "tooltip": "传递给 apply_chat_template 的 enable_thinking 参数。适用于支持该参数的 Qwen3.5 等模型；不支持时自动回退。/ Passed to apply_chat_template for models such as Qwen3.5 that support it; falls back automatically if unsupported."}),
                 "should_change": ("BOOLEAN", {"default": True}),
             },
             "optional": {
@@ -401,6 +422,7 @@ class LLMTextGenerator:
     def generate_text(self, model_instance, user_prompt, system_prompt, 
                       max_new_tokens, min_new_tokens, do_sample, temperature, top_p, top_k,
                       repetition_penalty, no_repeat_ngram_size, num_beams, length_penalty,
+                      enable_thinking,
                       content_part_1=None, content_part_2=None, content_part_3=None,
                       history_json_in="[]", prompt=None, extra_pnginfo=None, should_change = False):
         
@@ -520,8 +542,10 @@ class LLMTextGenerator:
                 if current_content:
                     final_messages.append({"role": "user", "content": current_content})
             
-            inputs = loaded_processor.apply_chat_template(
+            inputs = apply_chat_template_with_optional_thinking(
+                loaded_processor,
                 final_messages, 
+                enable_thinking=enable_thinking,
                 add_generation_prompt=True, 
                 tokenize=True, 
                 return_dict=True, 
@@ -565,8 +589,10 @@ class LLMTextGenerator:
                         {"role": "system", "content": system_prompt}, 
                         {"role": "user", "content": user_text}
                     ]
-                    inputs = loaded_tokenizer.apply_chat_template(
+                    inputs = apply_chat_template_with_optional_thinking(
+                        loaded_tokenizer,
                         messages_for_template, 
+                        enable_thinking=enable_thinking,
                         add_generation_prompt=True, 
                         tokenize=True, 
                         return_dict=True, 
