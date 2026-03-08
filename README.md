@@ -6,7 +6,7 @@
 并把你从huggingface拿到的所有模型仓库的东西都放进去:
 <img width="300" alt="image" src="imgs/04adbe75-0fb8-465f-baa0-02fcfeb1e7e8.png" />
 
-启动以后这么用：
+启动以后这么用，现在新版本不太一样了，但是我懒得补文档，自己看下llm节点栏目里面看吧，大概方法差不多()：
 <img height="1074" alt="image" src="imgs/4e7d10e9c985e091e7d89cf2bf6918bd.png" />
 
 这边的model_mode如果是gemma2,llama,qwen这种纯文本模型就选text，如果是qwen 2.5 vl和gemma3这种有视觉能力的就选multimodal
