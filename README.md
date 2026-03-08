@@ -14,6 +14,6 @@
 multimodal的可以输入图片，这样搞:
 <img height="1051" alt="image" src="imgs/1cd4a646-a29e-420f-8133-368df2551d36.png" />
 
-如果你用的是支持思维开关的 chat template（例如部分 Qwen3.5 模型），现在可以在 LLM 文本生成器里直接设置 enable_thinking。节点会把这个参数传给 processor 或 tokenizer 的 apply_chat_template；如果你当前 transformers 版本或模型处理器不支持这个参数，会自动回退，不会直接报错。
+如果你用的是支持思维开关的 chat template（例如部分 Qwen3.5 模型），现在可以在 LLM 文本生成器里直接设置 enable_thinking。节点会把这个参数直接传给 processor 或 tokenizer 的 apply_chat_template。
 
 感觉没了,有话请给我提issue(
